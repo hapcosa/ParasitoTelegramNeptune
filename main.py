@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 Bot de Trading Automatizado para BingX - FUTUROS USDT ISOLATED
-Multi-usuario con Monitor de Posiciones
+Multi-usuario con Monitor de Posiciones + Web Log Viewer
 """
-
+import aiohttp
+from aiohttp import web
+import aiohttp_cors
+from collections import deque
 import os
 import json
 import logging
@@ -22,13 +25,398 @@ import asyncio
 
 load_dotenv()
 
-log_level = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=getattr(logging, log_level)
-)
-logger = logging.getLogger(__name__)
+# =============================================================================
+# SERVIDOR WEB DE LOGS - DEFINIR ANTES DE CONFIGURAR LOGGING
+# =============================================================================
 
+log_buffer = deque(maxlen=1000)
+websocket_connections = set()
+
+
+class WebLogHandler(logging.Handler):
+    """Handler que captura logs y los envía a WebSocket"""
+
+    def emit(self, record):
+        try:
+            log_entry = {
+                'id': int(datetime.now().timestamp() * 1000),
+                'timestamp': datetime.fromtimestamp(record.created).isoformat(),
+                'level': record.levelname,
+                'message': self.format(record),
+                'user': getattr(record, 'user', 'system')
+            }
+
+            log_buffer.append(log_entry)
+
+            # Crear tarea de forma segura
+            try:
+                asyncio.create_task(broadcast_log(log_entry))
+            except RuntimeError:
+                # Si no hay event loop activo, ignorar
+                pass
+
+        except Exception as e:
+            print(f"Error en WebLogHandler: {e}")
+
+
+async def broadcast_log(log_entry):
+    """Envía un log a todos los WebSockets conectados"""
+    if websocket_connections:
+        message = json.dumps({
+            'type': 'new_log',
+            'data': log_entry
+        })
+
+        dead_connections = set()
+        for ws in websocket_connections:
+            try:
+                await ws.send_str(message)
+            except Exception:
+                dead_connections.add(ws)
+
+        websocket_connections.difference_update(dead_connections)
+
+
+async def websocket_handler(request):
+    """Maneja conexiones WebSocket"""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    websocket_connections.add(ws)
+    print(f"✅ Nueva conexión web. Total: {len(websocket_connections)}")
+
+    try:
+        if log_buffer:
+            await ws.send_str(json.dumps({
+                'type': 'initial_logs',
+                'data': list(log_buffer)
+            }))
+
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                if msg.data == 'ping':
+                    await ws.send_str('pong')
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                print(f'WebSocket error: {ws.exception()}')
+    finally:
+        websocket_connections.remove(ws)
+
+    return ws
+
+
+async def index(request):
+    """Página principal HTML"""
+    html = """<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 NeptuneBot - Log Viewer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #1e293b; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div id="root" class="min-h-screen p-6"></div>
+
+    <script>
+        let ws = null;
+        let logs = [];
+        let filter = 'all';
+        let searchTerm = '';
+        let autoScroll = true;
+        let isConnected = false;
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                console.log('✅ WebSocket conectado');
+                isConnected = true;
+                updateUI();
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'initial_logs') {
+                    logs = data.data;
+                } else if (data.type === 'new_log') {
+                    logs.push(data.data);
+                    if (logs.length > 1000) logs.shift();
+                } else if (data.type === 'logs_cleared') {
+                    logs = [];
+                }
+                updateUI();
+            };
+
+            ws.onclose = () => {
+                console.log('❌ WebSocket desconectado');
+                isConnected = false;
+                updateUI();
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        function getLevelColor(level) {
+            const colors = {
+                'INFO': 'text-blue-400 bg-blue-500/10',
+                'WARNING': 'text-yellow-400 bg-yellow-500/10',
+                'ERROR': 'text-red-400 bg-red-500/10',
+                'SUCCESS': 'text-green-400 bg-green-500/10'
+            };
+            return colors[level] || 'text-gray-400 bg-gray-500/10';
+        }
+
+        function getLevelIcon(level) {
+            const icons = { 'INFO': '📘', 'WARNING': '⚠️', 'ERROR': '❌', 'SUCCESS': '✅' };
+            return icons[level] || '📋';
+        }
+
+        function filterLogs() {
+            return logs.filter(log => {
+                const matchesFilter = filter === 'all' || log.level === filter;
+                const matchesSearch = log.message.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                                     log.user.toLowerCase().includes(searchTerm.toLowerCase());
+                return matchesFilter && matchesSearch;
+            });
+        }
+
+        function updateUI() {
+            const filtered = filterLogs();
+            const stats = {
+                total: logs.length,
+                info: logs.filter(l => l.level === 'INFO').length,
+                warning: logs.filter(l => l.level === 'WARNING').length,
+                error: logs.filter(l => l.level === 'ERROR').length
+            };
+
+            document.getElementById('root').innerHTML = `
+                <div class="max-w-7xl mx-auto">
+                    <div class="mb-6">
+                        <div class="flex items-center justify-between mb-4">
+                            <div>
+                                <h1 class="text-3xl font-bold text-white flex items-center gap-3">
+                                    🤖 NeptuneBot Log Viewer
+                                </h1>
+                                <p class="text-gray-400 mt-1">Monitoreo en tiempo real de logs del bot</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <div class="px-3 py-1 rounded-full text-sm font-medium flex items-center gap-2 ${
+                                    isConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+                                }">
+                                    <div class="w-2 h-2 rounded-full ${isConnected ? 'bg-green-400 pulse' : 'bg-red-400'}"></div>
+                                    ${isConnected ? 'Conectado' : 'Desconectado'}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-4 gap-4 mb-6">
+                            <div class="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                                <div class="text-sm text-gray-400">Total Logs</div>
+                                <div class="text-2xl font-bold text-white">${stats.total}</div>
+                            </div>
+                            <div class="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
+                                <div class="text-sm text-blue-300">Info</div>
+                                <div class="text-2xl font-bold text-blue-400">${stats.info}</div>
+                            </div>
+                            <div class="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4">
+                                <div class="text-sm text-yellow-300">Warnings</div>
+                                <div class="text-2xl font-bold text-yellow-400">${stats.warning}</div>
+                            </div>
+                            <div class="bg-red-500/10 border border-red-500/30 rounded-lg p-4">
+                                <div class="text-sm text-red-300">Errors</div>
+                                <div class="text-2xl font-bold text-red-400">${stats.error}</div>
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap gap-4 items-center bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                            <div class="flex-1 min-w-[200px]">
+                                <input
+                                    type="text"
+                                    placeholder="🔍 Buscar en logs..."
+                                    value="${searchTerm}"
+                                    oninput="searchTerm = this.value; updateUI();"
+                                    class="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                                />
+                            </div>
+
+                            <div class="flex gap-2">
+                                <button onclick="filter = 'all'; updateUI();" class="px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'all' ? 'bg-blue-500 text-white' : 'bg-slate-700 text-gray-300 hover:bg-slate-600'}">Todos</button>
+                                <button onclick="filter = 'INFO'; updateUI();" class="px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'INFO' ? 'bg-blue-500 text-white' : 'bg-slate-700 text-gray-300 hover:bg-slate-600'}">Info</button>
+                                <button onclick="filter = 'WARNING'; updateUI();" class="px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'WARNING' ? 'bg-yellow-500 text-white' : 'bg-slate-700 text-gray-300 hover:bg-slate-600'}">Warnings</button>
+                                <button onclick="filter = 'ERROR'; updateUI();" class="px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'ERROR' ? 'bg-red-500 text-white' : 'bg-slate-700 text-gray-300 hover:bg-slate-600'}">Errors</button>
+                            </div>
+
+                            <div class="flex gap-2 ml-auto">
+                                <button onclick="autoScroll = !autoScroll; updateUI();" class="p-2 rounded-lg transition-colors ${autoScroll ? 'bg-blue-500 text-white' : 'bg-slate-700 text-gray-300 hover:bg-slate-600'}" title="Auto-scroll">🔄</button>
+                                <button onclick="exportLogs()" class="p-2 bg-slate-700 text-gray-300 rounded-lg hover:bg-slate-600 transition-colors" title="Exportar logs">💾</button>
+                                <button onclick="clearLogs()" class="p-2 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 transition-colors" title="Limpiar logs">🗑️</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="logs-container" class="bg-slate-900 border border-slate-700 rounded-lg p-4 h-[600px] overflow-y-auto font-mono text-sm custom-scrollbar">
+                        ${filtered.length === 0 ? `
+                            <div class="flex flex-col items-center justify-center h-full text-gray-500">
+                                <div class="text-4xl mb-2 opacity-50">📋</div>
+                                <p>No hay logs para mostrar</p>
+                                <p class="text-xs mt-2">Esperando logs del bot...</p>
+                            </div>
+                        ` : filtered.map(log => `
+                            <div class="mb-2 p-3 bg-slate-800/50 border border-slate-700 rounded hover:bg-slate-800 transition-colors">
+                                <div class="flex items-start gap-3">
+                                    <div class="flex items-center gap-2 px-2 py-1 rounded ${getLevelColor(log.level)}">
+                                        <span>${getLevelIcon(log.level)}</span>
+                                        <span class="font-bold text-xs">${log.level}</span>
+                                    </div>
+                                    <div class="flex-1 min-w-0">
+                                        <div class="flex items-center gap-2 mb-1">
+                                            <span class="text-gray-400 text-xs">${new Date(log.timestamp).toLocaleTimeString()}</span>
+                                            <span class="text-blue-400 text-xs bg-blue-500/10 px-2 py-0.5 rounded">${log.user}</span>
+                                        </div>
+                                        <div class="text-gray-200 break-words">${log.message}</div>
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+
+                    <div class="mt-4 text-center text-gray-500 text-sm">
+                        Mostrando ${filtered.length} de ${logs.length} logs
+                    </div>
+                </div>
+            `;
+
+            if (autoScroll) {
+                const container = document.getElementById('logs-container');
+                if (container) container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        function exportLogs() {
+            const filtered = filterLogs();
+            const text = filtered.map(log => 
+                `${log.timestamp} [${log.level}] [${log.user}] ${log.message}`
+            ).join('\\n');
+
+            const blob = new Blob([text], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `neptune-logs-${new Date().toISOString().split('T')[0]}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        async function clearLogs() {
+            if (confirm('¿Estás seguro de que quieres limpiar todos los logs?')) {
+                await fetch('/api/clear', { method: 'POST' });
+            }
+        }
+
+        connectWebSocket();
+        updateUI();
+    </script>
+</body>
+</html>"""
+    return web.Response(text=html, content_type='text/html')
+
+
+async def get_logs(request):
+    """API endpoint para obtener logs"""
+    return web.json_response({'logs': list(log_buffer), 'total': len(log_buffer)})
+
+
+async def clear_logs(request):
+    """API endpoint para limpiar logs"""
+    log_buffer.clear()
+    message = json.dumps({'type': 'logs_cleared'})
+    for ws in websocket_connections:
+        try:
+            await ws.send_str(message)
+        except Exception:
+            pass
+    return web.json_response({'success': True})
+
+
+def create_web_app():
+    """Crea la aplicación web"""
+    app = web.Application()
+
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+        )
+    })
+
+    app.router.add_get('/', index)
+    app.router.add_get('/ws', websocket_handler)
+    app.router.add_get('/api/logs', get_logs)
+    app.router.add_post('/api/clear', clear_logs)
+
+    for route in list(app.router.routes()):
+        cors.add(route)
+
+    return app
+
+
+async def start_web_server():
+    """Inicia el servidor web en segundo plano"""
+    app = create_web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, 'localhost', 8765)
+    await site.start()
+
+    print("=" * 60)
+    print("🌐 SERVIDOR DE LOGS INICIADO")
+    print("=" * 60)
+    print("📊 URL: http://localhost:8765")
+    print("=" * 60)
+
+
+# =============================================================================
+# CONFIGURAR LOGGING - AHORA QUE WebLogHandler ESTÁ DEFINIDO
+# =============================================================================
+
+log_level = os.getenv("LOG_LEVEL", "INFO")
+
+# Crear el logger
+logger = logging.getLogger(__name__)
+logger.setLevel(getattr(logging, log_level))
+
+# Handler para consola
+console_handler = logging.StreamHandler()
+console_handler.setLevel(getattr(logging, log_level))
+console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+
+# Handler para web
+web_handler = WebLogHandler()
+web_handler.setLevel(getattr(logging, log_level))
+web_formatter = logging.Formatter('%(message)s')
+web_handler.setFormatter(web_formatter)
+
+# Configurar el logger raíz
+root_logger = logging.getLogger('')
+root_logger.setLevel(getattr(logging, log_level))
+root_logger.addHandler(console_handler)
+root_logger.addHandler(web_handler)
+
+
+# =============================================================================
+# RESTO DEL CÓDIGO DEL BOT (Sin cambios)
+# =============================================================================
 
 class ConfigManager:
     """Gestor de configuración JSON por usuario"""
@@ -1373,7 +1761,7 @@ async def main():
 
     # Iniciar monitor en segundo plano
     monitor_task = asyncio.create_task(bot.monitor.start())
-
+    web_server_task = asyncio.create_task(start_web_server())
     for attempt in range(max_retries):
         client = None
         try:
