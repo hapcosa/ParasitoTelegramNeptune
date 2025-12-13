@@ -10,7 +10,9 @@ import logging
 from typing import Dict, Optional, List
 from datetime import datetime
 from dotenv import load_dotenv
+import telethon
 from telethon import TelegramClient, events
+from telethon.errors import TypeNotFoundError
 import hmac
 import hashlib
 import time
@@ -425,7 +427,7 @@ class TradingBot:
 
         # Usuario 1
         username1 = os.getenv("TELEGRAM_USERNAME", "").strip().strip("'\"")
-        user1_id = os.getenv("TELEGRAM_USER_ID")  # Nuevo: ID de Telegram
+        user1_id = os.getenv("TELEGRAM_USER_ID")
         bingx_key1 = os.getenv("BINGX_API_KEY")
         bingx_secret1 = os.getenv("BINGX_SECRET_KEY")
 
@@ -798,114 +800,159 @@ Señales automáticas:
 # ============================================================================
 
 async def main():
-    """Función principal con Telethon"""
+    """Función principal con Telethon y manejo robusto de errores"""
 
-    # Credenciales de Telegram API
     api_id = int(os.getenv("TELEGRAM_API_ID"))
     api_hash = os.getenv("TELEGRAM_API_HASH")
     phone = os.getenv("TELEGRAM_PHONE")
-
-    # Chat/grupo donde escuchar
     target_chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
 
-    # Crear cliente de Telethon
-    client = TelegramClient('trading_session', api_id, api_hash)
+    # Configuración de reconexión
+    max_retries = 5
+    retry_delay = 5  # segundos
 
-    await client.start(phone=phone)
-    logger.info("✅ Telethon conectado")
-
-    me = await client.get_me()
-    logger.info(f"👤 Conectado como: {me.first_name} (@{me.username})")
-
-    @client.on(events.NewMessage(chats=target_chat_id))
-    async def handler(event):
-        """Maneja todos los mensajes nuevos en el chat"""
+    for attempt in range(max_retries):
         try:
-            message = event.message.text
+            # Crear cliente con configuración más robusta
+            client = TelegramClient(
+                'trading_session',
+                api_id,
+                api_hash,
+                connection_retries=5,
+                retry_delay=retry_delay
+            )
 
-            if not message:
-                return
+            await client.start(phone=phone)
+            logger.info("✅ Telethon conectado")
 
-            # Obtener información del remitente
-            sender = await event.get_sender()
-            sender_name = "Unknown"
-            sender_id = None
-            is_bot = False
+            me = await client.get_me()
+            logger.info(f"👤 Conectado como: {me.first_name} (@{me.username})")
 
-            if sender:
-                sender_name = sender.first_name or "Unknown"
-                sender_id = sender.id
-                is_bot = getattr(sender, 'bot', False)
+            @client.on(events.NewMessage(chats=target_chat_id))
+            async def handler(event):
+                """Maneja todos los mensajes nuevos en el chat"""
+                try:
+                    message = event.message.text
 
-            logger.info(f"📨 Mensaje de {'🤖 BOT' if is_bot else '👤'} {sender_name} (ID: {sender_id}): {message}")
+                    if not message:
+                        return
 
-            # Si es un comando (empieza con /)
-            if message.startswith("/"):
-                if sender_id:
-                    await handle_command(event, sender_id)
-                return
+                    # Obtener información del remitente
+                    sender = await event.get_sender()
+                    sender_name = "Unknown"
+                    sender_id = None
+                    is_bot = False
 
-            # Parsear señal
-            signal = bot.parse_signal(message)
+                    if sender:
+                        sender_name = sender.first_name or "Unknown"
+                        sender_id = sender.id
+                        is_bot = getattr(sender, 'bot', False)
 
-            if not signal:
-                logger.info("ℹ️ No es una señal válida")
-                return
+                    logger.info(f"📨 Mensaje de {'🤖 BOT' if is_bot else '👤'} {sender_name} (ID: {sender_id}): {message}")
 
-            # 🔒 SEGURIDAD: Solo aceptar señales de BOTS
-            if not is_bot:
-                logger.warning(f"⚠️ Señal ignorada: viene de usuario {sender_name} (ID: {sender_id}), no de un bot")
-                logger.info("💡 Las señales automáticas solo pueden venir de bots de Telegram")
-                return
+                    # Si es un comando
+                    if message.startswith("/"):
+                        if sender_id:
+                            await handle_command(event, sender_id)
+                        return
 
-            logger.info(f"🎯 SEÑAL DETECTADA (de BOT): {signal}")
+                    # Parsear señal
+                    signal = bot.parse_signal(message)
 
-            # Ejecutar señal para TODOS los usuarios
-            results = await bot.execute_signal_for_all_users(signal)
+                    if not signal:
+                        logger.info("ℹ️ No es una señal válida")
+                        return
 
-            # Construir respuesta
-            success_count = sum(1 for r in results if r.get("success"))
-            total_count = len(results)
+                    # Seguridad: Solo aceptar señales de BOTS
+                    if not is_bot:
+                        logger.warning(
+                            f"⚠️ Señal ignorada: viene de usuario {sender_name} (ID: {sender_id}), no de un bot")
+                        return
 
-            if success_count == total_count:
-                response = f"✅ {signal['action'].upper()} ejecutado en {success_count}/{total_count} cuentas: {signal['symbol']}\n"
-                for r in results:
-                    user_id = r.get('user_identifier', 'Unknown')
-                    if signal["action"] == "open":
-                        response += f"• {user_id}: ${r.get('margin_used', 0):.2f}\n"
+                    logger.info(f"🎯 SEÑAL DETECTADA (de BOT): {signal}")
+
+                    # Ejecutar señal para TODOS los usuarios
+                    results = await bot.execute_signal_for_all_users(signal)
+
+                    # Construir respuesta
+                    success_count = sum(1 for r in results if r.get("success"))
+                    total_count = len(results)
+
+                    if success_count == total_count:
+                        response = f"✅ {signal['action'].upper()} ejecutado en {success_count}/{total_count} cuentas: {signal['symbol']}\n"
+                        for r in results:
+                            user_id = r.get('user_identifier', 'Unknown')
+                            if signal["action"] == "open":
+                                response += f"• {user_id}: ${r.get('margin_used', 0):.2f}\n"
+                            else:
+                                response += f"• {user_id}: ✓\n"
                     else:
-                        response += f"• {user_id}: ✓\n"
+                        response = f"⚠️ {signal['action'].upper()} ejecutado en {success_count}/{total_count} cuentas: {signal['symbol']}\n"
+                        for r in results:
+                            user_id = r.get('user_identifier', 'Unknown')
+                            if r.get("success"):
+                                response += f"• {user_id}: ✅\n"
+                            else:
+                                response += f"• {user_id}: ❌ {r.get('error', 'Error')}\n"
+
+                    logger.info(response)
+
+                    try:
+                        await event.reply(response)
+                    except Exception as e:
+                        logger.warning(f"No se pudo responder: {e}")
+
+                except Exception as e:
+                    logger.error(f"❌ Error en handler: {e}")
+
+            logger.info("=" * 60)
+            logger.info("🤖 NEPTUNEBOT INICIADO CON TELETHON")
+            logger.info("=" * 60)
+            logger.info(f"👥 Usuarios: {list(bot.user_exchanges.keys())}")
+            logger.info(f"💬 Escuchando en chat ID: {target_chat_id}")
+            logger.info("📡 Escuchando TODOS los mensajes (incluidos bots)...")
+            logger.info("=" * 60)
+
+            # Mantener el cliente corriendo
+            await client.run_until_disconnected()
+
+        except telethon.errors.TypeNotFoundError as e:
+            logger.error(f"❌ Error de tipo Telethon (intento {attempt + 1}/{max_retries}): {e}")
+            logger.info("🔄 Reconectando en 5 segundos...")
+            await asyncio.sleep(retry_delay)
+
+            if attempt < max_retries - 1:
+                continue
             else:
-                response = f"⚠️ {signal['action'].upper()} ejecutado en {success_count}/{total_count} cuentas: {signal['symbol']}\n"
-                for r in results:
-                    user_id = r.get('user_identifier', 'Unknown')
-                    if r.get("success"):
-                        response += f"• {user_id}: ✅\n"
-                    else:
-                        response += f"• {user_id}: ❌ {r.get('error', 'Error')}\n"
-
-            logger.info(response)
-
-            # Enviar respuesta al chat
-            try:
-                await event.reply(response)
-            except Exception as e:
-                logger.warning(f"No se pudo responder: {e}")
+                logger.error("❌ Máximo de reintentos alcanzado")
+                raise
 
         except Exception as e:
-            logger.error(f"❌ Error en handler: {e}")
+            logger.error(f"❌ Error crítico (intento {attempt + 1}/{max_retries}): {e}")
+            await asyncio.sleep(retry_delay)
 
-    logger.info("=" * 60)
-    logger.info("🤖 NEPTUNEBOT INICIADO CON TELETHON")
-    logger.info("=" * 60)
-    logger.info(f"👥 Usuarios: {list(bot.user_exchanges.keys())}")
-    logger.info(f"💬 Escuchando en chat ID: {target_chat_id}")
-    logger.info("📡 Escuchando TODOS los mensajes (incluidos bots)...")
-    logger.info("=" * 60)
+            if attempt < max_retries - 1:
+                continue
+            else:
+                raise
 
-    # Mantener el cliente corriendo
-    await client.run_until_disconnected()
+        finally:
+            try:
+                if 'client' in locals():
+                    await client.disconnect()
+            except:
+                pass
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Loop infinito para reiniciar automáticamente
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            logger.info("👋 Bot detenido por el usuario")
+            break
+        except Exception as e:
+            logger.error(f"❌ Error fatal: {e}")
+            logger.info("🔄 Reiniciando en 10 segundos...")
+            time.sleep(10)
